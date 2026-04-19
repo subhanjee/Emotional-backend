@@ -1,0 +1,41 @@
+{
+  "users": [
+    {
+      "id": "a725cd50-6186-4c58-9f83-02a632c93900",
+      "name": "Subhan",
+      "email": "admin@example.com",
+      "passwordHash": "$2b$10$zVTT7eE6l1gVFALO6R2JN.JgrZa.Zdc/ihRDe/5mYVRUgfGTLKNUe",
+      "createdAt": "2026-04-19T19:46:32.133Z",
+      "role": "admin"
+    }
+  ],
+  "assessments": [
+    {
+      "id": "7c8ded04-b51f-4d88-ae16-605a77798122",
+      "userId": "a725cd50-6186-4c58-9f83-02a632c93900",
+      "responses": [
+        1,
+        3,
+        2,
+        2,
+        3,
+        3,
+        2,
+        0,
+        2,
+        3
+      ],
+      "emotionalText": "Not just a gift… it’s a feeling ❤️\nMake your loved ones feel special with unique gifts from Rsutam Treasures 🎀\n\n🎉 Customized | Affordable | Beautiful\n🚚 Delivery available\n\nOrder now via DM 📩",
+      "structuredScore": 21,
+      "textBoost": 0,
+      "finalScore": 21,
+      "severity": "Moderate",
+      "confidence": 87,
+      "keywordHighlights": [],
+      "riskSignals": [],
+      "riskFlag": false,
+      "supportMessage": "No acute high-risk phrases detected in this response.",
+      "createdAt": "2026-04-19T19:48:27.131Z"
+    }
+  ]
+}
