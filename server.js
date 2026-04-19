@@ -1,10 +1,8 @@
 const express = require("express");
 const cors = require("cors");
-const fs = require("fs");
-const path = require("path");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
-const { randomUUID } = require("crypto");
+const mongoose = require("mongoose");
 require("dotenv").config();
 
 const app = express();
@@ -13,7 +11,7 @@ const JWT_SECRET = process.env.JWT_SECRET || "dev-only-secret-change-in-producti
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "http://localhost:5173";
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || "admin@example.com").toLowerCase().trim();
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "Admin@12345";
-const DB_PATH = path.join(__dirname, "db.json");
+const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/fyp_depression";
 
 app.use(cors({ origin: FRONTEND_ORIGIN, credentials: false }));
 app.use(express.json());
@@ -31,22 +29,40 @@ const QUESTIONS = [
   "I felt hopeless about improving my situation or achieving my goals.",
 ];
 
-function ensureDb() {
-  if (!fs.existsSync(DB_PATH)) {
-    const initial = { users: [], assessments: [] };
-    fs.writeFileSync(DB_PATH, JSON.stringify(initial, null, 2), "utf-8");
-  }
-}
+const userSchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true, trim: true },
+    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+    passwordHash: { type: String, required: true },
+    role: { type: String, enum: ["student", "admin"], default: "student" },
+  },
+  { timestamps: { createdAt: "createdAt", updatedAt: false } }
+);
 
-function readDb() {
-  ensureDb();
-  const raw = fs.readFileSync(DB_PATH, "utf-8");
-  return JSON.parse(raw);
-}
+const assessmentSchema = new mongoose.Schema(
+  {
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    responses: {
+      type: [Number],
+      required: true,
+      validate: (val) => Array.isArray(val) && val.length === QUESTIONS.length,
+    },
+    emotionalText: { type: String, required: true, trim: true },
+    structuredScore: { type: Number, required: true },
+    textBoost: { type: Number, required: true },
+    finalScore: { type: Number, required: true },
+    severity: { type: String, required: true },
+    confidence: { type: Number, required: true },
+    keywordHighlights: { type: [String], default: [] },
+    riskSignals: { type: [String], default: [] },
+    riskFlag: { type: Boolean, default: false },
+    supportMessage: { type: String, required: true },
+  },
+  { timestamps: { createdAt: "createdAt", updatedAt: false } }
+);
 
-function writeDb(data) {
-  fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2), "utf-8");
-}
+const User = mongoose.model("User", userSchema);
+const Assessment = mongoose.model("Assessment", assessmentSchema);
 
 function authMiddleware(req, res, next) {
   const authHeader = req.headers.authorization || "";
@@ -65,17 +81,20 @@ function authMiddleware(req, res, next) {
   }
 }
 
-function adminOnly(req, res, next) {
-  const db = readDb();
-  const currentUser = db.users.find((user) => user.id === req.userId);
-  if (!currentUser) {
-    return res.status(404).json({ message: "User not found." });
+async function adminOnly(req, res, next) {
+  try {
+    const currentUser = await User.findById(req.userId).lean();
+    if (!currentUser) {
+      return res.status(404).json({ message: "User not found." });
+    }
+    if (currentUser.role !== "admin") {
+      return res.status(403).json({ message: "Admin access required." });
+    }
+    req.currentUser = currentUser;
+    next();
+  } catch (error) {
+    return res.status(500).json({ message: "Server error." });
   }
-  if (currentUser.role !== "admin") {
-    return res.status(403).json({ message: "Admin access required." });
-  }
-  req.currentUser = currentUser;
-  next();
 }
 
 function classifySeverity(score) {
@@ -121,32 +140,22 @@ function detectRiskSignals(text) {
   return highRiskTerms.filter((term) => lower.includes(term));
 }
 
-async function ensureAdminAndRoles() {
-  const db = readDb();
-  let changed = false;
-
-  db.users = db.users.map((user) => {
-    const role = user.role || (user.email === ADMIN_EMAIL ? "admin" : "student");
-    if (!user.role) changed = true;
-    return { ...user, role };
-  });
-
-  const existingAdmin = db.users.find((user) => user.email === ADMIN_EMAIL);
+async function ensureAdminUser() {
+  const existingAdmin = await User.findOne({ email: ADMIN_EMAIL });
   if (!existingAdmin) {
     const passwordHash = await bcrypt.hash(ADMIN_PASSWORD, 10);
-    db.users.push({
-      id: randomUUID(),
+    await User.create({
       name: "System Admin",
       email: ADMIN_EMAIL,
       passwordHash,
       role: "admin",
-      createdAt: new Date().toISOString(),
     });
-    changed = true;
+    return;
   }
 
-  if (changed) {
-    writeDb(db);
+  if (existingAdmin.role !== "admin") {
+    existingAdmin.role = "admin";
+    await existingAdmin.save();
   }
 }
 
@@ -171,29 +180,23 @@ app.post("/api/auth/register", async (req, res) => {
       });
     }
 
-    const db = readDb();
-
-    if (db.users.some((u) => u.email === normalizedEmail)) {
+    const existing = await User.findOne({ email: normalizedEmail }).lean();
+    if (existing) {
       return res.status(409).json({ message: "User already exists with this email." });
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
-    const user = {
-      id: randomUUID(),
+    const user = await User.create({
       name: String(name).trim(),
       email: normalizedEmail,
       passwordHash,
       role: "student",
-      createdAt: new Date().toISOString(),
-    };
+    });
 
-    db.users.push(user);
-    writeDb(db);
-
-    const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: "7d" });
+    const token = jwt.sign({ userId: user._id.toString() }, JWT_SECRET, { expiresIn: "7d" });
     res.status(201).json({
       token,
-      user: { id: user.id, name: user.name, email: user.email, role: user.role },
+      user: { id: user._id.toString(), name: user.name, email: user.email, role: user.role },
     });
   } catch (error) {
     res.status(500).json({ message: "Server error during registration." });
@@ -207,12 +210,11 @@ app.post("/api/auth/login", async (req, res) => {
       return res.status(400).json({ message: "Email and password are required." });
     }
 
-    const db = readDb();
     const normalizedEmail = String(email).toLowerCase().trim();
     if (!isValidEmail(normalizedEmail)) {
       return res.status(400).json({ message: "Please provide a valid email address." });
     }
-    const user = db.users.find((u) => u.email === normalizedEmail);
+    const user = await User.findOne({ email: normalizedEmail });
 
     if (!user) {
       return res.status(401).json({ message: "Invalid email or password." });
@@ -223,10 +225,10 @@ app.post("/api/auth/login", async (req, res) => {
       return res.status(401).json({ message: "Invalid email or password." });
     }
 
-    const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: "7d" });
+    const token = jwt.sign({ userId: user._id.toString() }, JWT_SECRET, { expiresIn: "7d" });
     res.json({
       token,
-      user: { id: user.id, name: user.name, email: user.email, role: user.role || "student" },
+      user: { id: user._id.toString(), name: user.name, email: user.email, role: user.role },
     });
   } catch (error) {
     res.status(500).json({ message: "Server error during login." });
@@ -234,15 +236,21 @@ app.post("/api/auth/login", async (req, res) => {
 });
 
 app.get("/api/auth/me", authMiddleware, (req, res) => {
-  const db = readDb();
-  const user = db.users.find((u) => u.id === req.userId);
-  if (!user) {
-    return res.status(404).json({ message: "User not found." });
-  }
-  res.json({ id: user.id, name: user.name, email: user.email, role: user.role || "student" });
+  User.findById(req.userId)
+    .lean()
+    .then((user) => {
+      if (!user) return res.status(404).json({ message: "User not found." });
+      return res.json({
+        id: user._id.toString(),
+        name: user.name,
+        email: user.email,
+        role: user.role || "student",
+      });
+    })
+    .catch(() => res.status(500).json({ message: "Server error." }));
 });
 
-app.post("/api/assessments", authMiddleware, (req, res) => {
+app.post("/api/assessments", authMiddleware, async (req, res) => {
   const { responses, emotionalText } = req.body;
   if (!Array.isArray(responses) || responses.length !== QUESTIONS.length) {
     return res.status(400).json({ message: `Exactly ${QUESTIONS.length} responses are required.` });
@@ -274,28 +282,28 @@ app.post("/api/assessments", authMiddleware, (req, res) => {
     ? "Your response suggests elevated distress. Please contact a trusted person or counselor immediately."
     : "No acute high-risk phrases detected in this response.";
 
-  const db = readDb();
-  const assessment = {
-    id: randomUUID(),
-    userId: req.userId,
-    responses,
-    emotionalText: normalizedText,
-    structuredScore,
-    textBoost,
-    finalScore,
-    severity,
-    confidence,
-    keywordHighlights: keywords,
-    riskSignals,
-    riskFlag,
-    supportMessage,
-    createdAt: new Date().toISOString(),
-  };
+  try {
+    await Assessment.create({
+      userId: req.userId,
+      responses,
+      emotionalText: normalizedText,
+      structuredScore,
+      textBoost,
+      finalScore,
+      severity,
+      confidence,
+      keywordHighlights: keywords,
+      riskSignals,
+      riskFlag,
+      supportMessage,
+    });
 
-  db.assessments.push(assessment);
-  writeDb(db);
-
-  res.status(201).json({ message: "Assessment submitted successfully. Results are visible to admin only." });
+    res
+      .status(201)
+      .json({ message: "Assessment submitted successfully. Results are visible to admin only." });
+  } catch (error) {
+    res.status(500).json({ message: "Server error during assessment submission." });
+  }
 });
 
 app.get("/api/assessments/history", authMiddleware, (req, res) => {
@@ -303,27 +311,57 @@ app.get("/api/assessments/history", authMiddleware, (req, res) => {
 });
 
 app.get("/api/admin/assessments", authMiddleware, adminOnly, (req, res) => {
-  const db = readDb();
-  const history = db.assessments
-    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-  const usersById = Object.fromEntries(
-    db.users.map((user) => [user.id, { id: user.id, name: user.name, email: user.email }])
-  );
-  const enriched = history.map((entry) => ({
-    ...entry,
-    student: usersById[entry.userId] || null,
-  }));
-  res.json(enriched);
+  Assessment.find({})
+    .sort({ createdAt: -1 })
+    .populate("userId", "name email")
+    .lean()
+    .then((history) => {
+      const enriched = history.map((entry) => ({
+        id: entry._id.toString(),
+        userId: entry.userId?._id?.toString?.() || "",
+        responses: entry.responses,
+        emotionalText: entry.emotionalText,
+        structuredScore: entry.structuredScore,
+        textBoost: entry.textBoost,
+        finalScore: entry.finalScore,
+        severity: entry.severity,
+        confidence: entry.confidence,
+        keywordHighlights: entry.keywordHighlights,
+        riskSignals: entry.riskSignals,
+        riskFlag: entry.riskFlag,
+        supportMessage: entry.supportMessage,
+        createdAt: entry.createdAt,
+        student: entry.userId
+          ? {
+              id: entry.userId._id.toString(),
+              name: entry.userId.name,
+              email: entry.userId.email,
+            }
+          : null,
+      }));
+      return res.json(enriched);
+    })
+    .catch(() => res.status(500).json({ message: "Server error." }));
 });
 
-app.listen(PORT, async () => {
-  ensureDb();
-  await ensureAdminAndRoles();
-  if (!process.env.JWT_SECRET) {
-    console.warn("Warning: JWT_SECRET is not set. Using fallback development secret.");
+async function startServer() {
+  try {
+    await mongoose.connect(MONGO_URI);
+    await ensureAdminUser();
+    if (!process.env.JWT_SECRET) {
+      console.warn("Warning: JWT_SECRET is not set. Using fallback development secret.");
+    }
+    if (!process.env.ADMIN_PASSWORD) {
+      console.warn("Warning: ADMIN_PASSWORD is not set. Using default admin password.");
+    }
+    console.log("MongoDB connected.");
+    app.listen(PORT, () => {
+      console.log(`API running on http://localhost:${PORT}`);
+    });
+  } catch (error) {
+    console.error("Failed to start server:", error.message);
+    process.exit(1);
   }
-  if (!process.env.ADMIN_PASSWORD) {
-    console.warn("Warning: ADMIN_PASSWORD is not set. Using default admin password.");
-  }
-  console.log(`API running on http://localhost:${PORT}`);
-});
+}
+
+startServer();
